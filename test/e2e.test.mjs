@@ -306,8 +306,10 @@ test('reminders go out once, and not for a class that was booked inside the wind
   assert.match(reminder.text, /Yoga/);
   await sleep(12_000); // two more notifier runs
   const { calls } = await mockState();
-  const reminders = calls.filter((c) => c.method === 'sendMessage' && /<b>Reminder<\/b>/.test(c.body.text));
-  assert.equal(reminders.length, 1, 'sent once, and only to Anna');
+  // Classes booked earlier for tomorrow can come due for their 24-hour reminder while
+  // the suite runs, so only the 1-hour reminders are counted here.
+  const reminders = calls.filter((c) => c.method === 'sendMessage' && /<b>Reminder<\/b> · In 1 hour/.test(c.body.text));
+  assert.deepEqual(reminders.map((c) => Number(c.body.chat_id)), [anna.id], 'sent once, and only to Anna');
 });
 
 test('the morning summary lists the classes of the day', async () => {
