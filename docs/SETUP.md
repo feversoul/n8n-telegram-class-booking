@@ -83,7 +83,7 @@ You need a machine with Docker and a public `https` address that leads to it. Te
 2. Get the files:
 
    ```bash
-   git clone https://github.com/lunox-work/n8n-telegram-class-booking.git
+   git clone https://github.com/feversoul/n8n-telegram-class-booking.git
    cd n8n-telegram-class-booking
    cp .env.example .env
    ```
@@ -232,7 +232,7 @@ SELECT studio.setup(calendar_url => 'https://YOUR-N8N-ADDRESS/webhook/studio-cal
 
 **Start again from scratch (part 2B).** This deletes all data: `docker compose down -v`, then `docker compose up -d`.
 
-**Something else.** [Open an issue](https://github.com/lunox-work/n8n-telegram-class-booking/issues) with the error text from the failed execution.
+**Something else.** [Open an issue](https://github.com/feversoul/n8n-telegram-class-booking/issues) with the error text from the failed execution.
 
 ## 7. Updating
 

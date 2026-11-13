@@ -1,6 +1,6 @@
 # n8n Telegram class booking
 
-[![test](https://github.com/lunox-work/n8n-telegram-class-booking/actions/workflows/test.yml/badge.svg)](https://github.com/lunox-work/n8n-telegram-class-booking/actions/workflows/test.yml)
+[![test](https://github.com/feversoul/n8n-telegram-class-booking/actions/workflows/test.yml/badge.svg)](https://github.com/feversoul/n8n-telegram-class-booking/actions/workflows/test.yml)
 
 A Telegram bot for a fitness studio, built with n8n and PostgreSQL. Trainers and admins see the schedule and the free times, book rooms for classes, move and cancel them, and get reminders. A room is never booked twice, and a trainer is never booked into two rooms at once.
 
@@ -31,7 +31,7 @@ Also included: an audit trail of who booked, moved and cancelled what, an error 
 For a new setup. You need Docker, a bot token from [@BotFather](https://t.me/BotFather), and a public `https` address that reaches this machine (your domain or a tunnel), because Telegram delivers updates to a webhook.
 
 ```bash
-git clone https://github.com/lunox-work/n8n-telegram-class-booking.git
+git clone https://github.com/feversoul/n8n-telegram-class-booking.git
 cd n8n-telegram-class-booking
 cp .env.example .env      # fill in the token, the address, studio name and time zone
 docker compose up -d
