@@ -6,6 +6,8 @@ A Telegram bot for a fitness studio, built with n8n and PostgreSQL. Trainers and
 
 Import four workflows and run one SQL file. No community nodes, no paid n8n features.
 
+**New to this? Follow [the step-by-step guide](docs/SETUP.md):** creating the bot, installing, the first run in the chat, daily use, settings and troubleshooting.
+
 ![The bot's replies: booking a class, losing a slot to someone else, the day's schedule, notifications](docs/chat.png)
 
 <sub>Rendered from the messages the bot sent during a test run. It is a drawing of the chat, not a Telegram screenshot.</sub>
