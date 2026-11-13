@@ -1,0 +1,116 @@
+{
+  "name": "Studio Bot · 3 Calendar feed",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Studio Bot · Calendar feed\nServes the schedule as an iCalendar feed that Google Calendar, Apple Calendar and Outlook can subscribe to. Postgres stays the source of truth; calendars only read.\n\nThe link needs the secret token from `studio.settings`. Add `&room=<id>` or `&trainer=<id>` for one room or one trainer; the bot hands out ready-made links under **Calendar**.\n\nTell the bot where this webhook lives: `SELECT studio.setup(calendar_url => 'https://<your n8n>/webhook/studio-calendar');`",
+        "width": 620,
+        "height": 280,
+        "color": 4
+      },
+      "id": "dc9f8472-979c-47a8-8cdb-fc3773285779",
+      "name": "About",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -340
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "studio-calendar",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "e50f68fd-6341-4d74-869e-b4e558781169",
+      "name": "Calendar link",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "81661bc7-8f9c-45c7-8117-45c6c3732eaf"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.ics($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.query ?? {}) }}"
+        }
+      },
+      "id": "07ceed19-3e60-4d54-8a18-d2c704104a8e",
+      "name": "Build feed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.data.body }}",
+        "options": {
+          "responseCode": "={{ $json.data.ok ? 200 : 404 }}",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "={{ $json.data.ok ? 'text/calendar; charset=utf-8' : 'text/plain; charset=utf-8' }}"
+              }
+            ]
+          }
+        }
+      },
+      "id": "42e92f26-246f-47b3-850e-615577df01ab",
+      "name": "Answer",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        0
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Calendar link": {
+      "main": [
+        [
+          {
+            "node": "Build feed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build feed": {
+      "main": [
+        [
+          {
+            "node": "Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "id": "studioBotCalendar"
+}

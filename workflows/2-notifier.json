@@ -1,0 +1,202 @@
+{
+  "name": "Studio Bot · 2 Notifier",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Studio Bot · Notifier\nRuns on a timer and sends what has come due: reminders before a class (24 hours and 1 hour by default), the morning summary, and any message a chat run could not deliver.\n\nTiming is set in Postgres with `studio.setup(reminder_minutes => ..., digest_time => ...)`. The interval here only decides how punctual reminders are. On n8n Cloud every run counts as an execution: every 5 minutes is 288 a day, so raise it if your plan is small.",
+        "width": 620,
+        "height": 260,
+        "color": 4
+      },
+      "id": "b98a5909-b5cb-4852-8b6e-787a19f9dfb7",
+      "name": "About",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "aa9bf48a-62ab-478e-82ce-fc633e743b63",
+      "name": "Every 5 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.claim_due($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ limit: 50 }) }}"
+        }
+      },
+      "id": "0b09a040-d899-47e0-8a29-3d170aa30792",
+      "name": "Claim due",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Shared by every Code node. scripts/build.mjs pastes this file in front of\n// route.js, render.js and notify.js, because n8n Code nodes cannot import.\n\nconst WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];\nconst MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];\n\n// Everything that came from a person or the database goes through esc()\n// before it is put into a message, because messages are sent as HTML.\nconst esc = (value) =>\n  String(value ?? '')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;');\n\n// Days travel as \"2026-11-14\" in data and as \"20261114\" inside buttons. They\n// are plain calendar dates in the studio's time zone; Postgres owns the clock.\nconst asDate = (iso) => new Date(`${iso}T00:00:00Z`);\nconst addDays = (iso, count) => {\n  const date = asDate(iso);\n  date.setUTCDate(date.getUTCDate() + count);\n  return date.toISOString().slice(0, 10);\n};\nconst dayName = (iso) => {\n  const date = asDate(iso);\n  return `${WEEKDAYS[date.getUTCDay()]} ${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]}`;\n};\nconst dayLabel = (iso, today) => {\n  if (iso === today) return `${dayName(iso)} (today)`;\n  if (iso === addDays(today, 1)) return `${dayName(iso)} (tomorrow)`;\n  return dayName(iso);\n};\nconst packDay = (iso) => iso.replace(/-/g, '');\nconst unpackDay = (packed) => {\n  if (!/^\\d{8}$/.test(packed ?? '')) return null;\n  const iso = `${packed.slice(0, 4)}-${packed.slice(4, 6)}-${packed.slice(6, 8)}`;\n  const date = asDate(iso);\n  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === iso ? iso : null;\n};\nconst packTime = (hhmm) => hhmm.replace(':', '');\nconst unpackTime = (packed) => {\n  if (!/^\\d{4}$/.test(packed ?? '')) return null;\n  const hours = Number(packed.slice(0, 2));\n  const minutes = Number(packed.slice(2, 4));\n  return hours < 24 && minutes < 60 ? `${packed.slice(0, 2)}:${packed.slice(2, 4)}` : null;\n};\n\nconst button = (text, data) => ({ text, callback_data: data });\nconst rowsOf = (items, perRow) => {\n  const rows = [];\n  for (let i = 0; i < items.length; i += perRow) rows.push(items.slice(i, i + perRow));\n  return rows;\n};\n\n// A booking or a move in progress is not stored anywhere. Each button carries\n// every choice made so far, for example \"b:c2:r1:d20261114:t0900\":\n//   c class type   r room (0 = ask)   d day   t start time\n//   p trainer (0 = ask)   n weeks to repeat   w week shown in the day picker\n// So there is no session to expire or to get out of step with the screen, and\n// \"Back\" is simply the same data with the last choice left out. Telegram\n// allows 64 bytes per button; the longest of these is under 50.\nconst STEP_KEYS = ['c', 'r', 'd', 't', 'p', 'n', 'w'];\nconst wizard = (base, steps) =>\n  [base]\n    .concat(\n      STEP_KEYS.filter((key) => steps[key] !== undefined && steps[key] !== null).map(\n        (key) => `${key}${steps[key]}`,\n      ),\n    )\n    .join(':');\nconst without = (steps, ...keys) =>\n  Object.fromEntries(Object.entries(steps).filter(([key]) => !keys.includes(key)));\nconst readSteps = (parts) => {\n  const steps = {};\n  for (const part of parts) {\n    const key = part[0];\n    const value = part.slice(1);\n    if (!STEP_KEYS.includes(key)) continue;\n    if (key === 'd' && unpackDay(value)) steps.d = value;\n    else if (key === 't' && unpackTime(value)) steps.t = value;\n    else if ('crpnw'.includes(key) && /^\\d{1,9}$/.test(value)) steps[key] = String(Number(value));\n  }\n  return steps;\n};\n// The \"Write notifications\" Code node: turn rows of studio.outbox into\n// messages. These go to people who did not tap anything: a trainer whose class\n// an admin moved, the admins when someone asks for access, reminders.\n\nfunction classLines(b, today) {\n  return [\n    `<b>${esc(b.class)}</b> · ${b.minutes} min`,\n    `Room: ${esc(b.room)}`,\n    `When: ${dayLabel(b.day, today)}, ${b.from}–${b.to}`,\n    `Trainer: ${esc(b.trainer)}`,\n  ].join('\\n');\n}\n\nfunction leadTime(minutes) {\n  if (minutes === 1440) return 'Tomorrow at this time';\n  if (minutes > 1440 && minutes % 1440 === 0) return `In ${minutes / 1440} days`;\n  if (minutes >= 60 && minutes % 60 === 0) return minutes === 60 ? 'In 1 hour' : `In ${minutes / 60} hours`;\n  return `In ${minutes} minutes`;\n}\n\nconst NOTIFICATIONS = {\n  access_request(p) {\n    return {\n      text: `<b>${esc(p.name)}</b>${p.username ? ` (@${esc(p.username)})` : ''} wants to use the studio bot.`,\n      rows: [[button('Review', `pv:${p.person_id}`)]],\n    };\n  },\n\n  access_granted(p, ctx) {\n    const role = p.role === 'admin' ? 'an admin' : 'a trainer';\n    return {\n      text: p.first_time\n        ? `You are in. You can now use the <b>${esc(ctx.studio.name)}</b> bot as ${role}.`\n        : `Your role at <b>${esc(ctx.studio.name)}</b> changed: you are now ${role}.`,\n      rows: [[button('Open the menu', 'h')]],\n    };\n  },\n\n  booked(p, ctx) {\n    const who = p.yours ? `${esc(p.actor)} booked you for` : `${esc(p.actor)} booked`;\n    const what = p.count > 1 ? `${p.count} weekly classes, starting with:` : 'a class:';\n    return {\n      text: `${who} ${what}\\n\\n${classLines(p.booking, ctx.today)}`,\n      rows: [[button('Open class', `v:${p.booking.id}`)]],\n    };\n  },\n\n  moved(p, ctx) {\n    return {\n      text: [\n        `${esc(p.actor)} moved ${p.yours ? 'your class' : 'a class'}.`,\n        '',\n        classLines(p.booking, ctx.today),\n        '',\n        `Was: ${dayLabel(p.was.day, ctx.today)}, ${p.was.from}–${p.was.to} · ${esc(p.was.room)}`,\n      ].join('\\n'),\n      rows: [[button('Open class', `v:${p.booking.id}`)]],\n    };\n  },\n\n  cancelled(p, ctx) {\n    const what = p.count > 1 ? `${p.count} classes, starting with:` : p.yours ? 'your class:' : 'a class:';\n    return {\n      text: `${esc(p.actor)} cancelled ${what}\\n\\n${classLines(p.booking, ctx.today)}`,\n      rows: [[button('📅 That day', `s:${packDay(p.booking.day)}`)]],\n    };\n  },\n\n  reminder(p, ctx) {\n    return {\n      text: `<b>Reminder</b> · ${leadTime(p.minutes)}\\n\\n${classLines(p.booking, ctx.today)}`,\n      rows: [[button('Open class', `v:${p.booking.id}`)]],\n    };\n  },\n\n  digest(p) {\n    const lines = [`<b>Your classes today</b>, ${dayName(p.day)}`, ''];\n    for (const b of p.classes) lines.push(`${b.from}–${b.to}  ${esc(b.class)} · ${esc(b.room)}`);\n    return { text: lines.join('\\n'), rows: [[button(\"📅 Today's schedule\", 's')]] };\n  },\n\n  alert(p) {\n    const lines = ['<b>The studio bot hit an error</b>', `Workflow: ${esc(p.workflow)}`];\n    if (p.node) lines.push(`Step: ${esc(p.node)}`);\n    lines.push('', esc(p.message));\n    if (p.url) lines.push('', esc(p.url));\n    return { text: lines.join('\\n'), rows: [] };\n  },\n};\n\n// ctx = the answer of studio.claim_due: { studio, today, messages }\nfunction notifications(ctx) {\n  return ctx.messages.map((message) => {\n    const write = NOTIFICATIONS[message.kind];\n    const view = write\n      ? write(message.payload, ctx)\n      : { text: `Studio bot: ${esc(message.kind)}`, rows: [] };\n    const body = { chat_id: message.chat_id, text: view.text, parse_mode: 'HTML', disable_web_page_preview: true };\n    if (view.rows.length) body.reply_markup = { inline_keyboard: view.rows };\n    return { id: message.id, method: 'sendMessage', body };\n  });\n}\n\nconst due = $input.first().json.data;\nreturn notifications(due).map((message) => ({ json: message }));"
+      },
+      "id": "765891c0-5343-448b-89fd-2ad9f1e4cef9",
+      "name": "Write notifications",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Claim due').first().json.data.api }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "f0efd694-ccab-469d-8018-73ad07bebed1",
+      "name": "Send notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// One row per message: did Telegram take it? A message that failed stays in\n// the outbox and is tried again by a later run.\nconst queued = $('Write notifications').all();\nconst results = $input.all().map((item, index) => ({\n  id: queued[index].json.id,\n  ok: item.json.ok === true,\n  error: item.json.ok === true ? null : String(item.json.description ?? item.json.error?.message ?? item.json.error ?? 'send failed'),\n}));\nreturn [{ json: { results } }];"
+      },
+      "id": "bb0496ad-0dd4-4a92-80cf-ff80f938e9a3",
+      "name": "Collect results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.record_deliveries($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json) }}"
+        }
+      },
+      "id": "d1a97066-8bea-431e-8493-42906dc159e7",
+      "name": "Record deliveries",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Every 5 minutes": {
+      "main": [
+        [
+          {
+            "node": "Claim due",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim due": {
+      "main": [
+        [
+          {
+            "node": "Write notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write notifications": {
+      "main": [
+        [
+          {
+            "node": "Send notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send notification": {
+      "main": [
+        [
+          {
+            "node": "Collect results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect results": {
+      "main": [
+        [
+          {
+            "node": "Record deliveries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none"
+  },
+  "id": "studioBotNotify01"
+}

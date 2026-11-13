@@ -1,0 +1,62 @@
+# Postgres + n8n with the studio bot already imported.
+#   cp .env.example .env   (fill it in)   then   docker compose up -d
+# Already have n8n? You do not need this file: see "Add it to your n8n" in the README.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: studio
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: studio
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in .env}
+      TELEGRAM_API_BASE: ${TELEGRAM_API_BASE:-https://api.telegram.org}
+      STUDIO_NAME: ${STUDIO_NAME:-Studio}
+      STUDIO_TIMEZONE: ${STUDIO_TIMEZONE:-UTC}
+      WEBHOOK_URL: ${WEBHOOK_URL:?set WEBHOOK_URL in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/install.sql:/docker-entrypoint-initdb.d/10-install.sql:ro
+      - ./docker/setup-studio.sh:/docker-entrypoint-initdb.d/20-setup-studio.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U studio -d studio"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  n8n:
+    image: ${N8N_IMAGE:-n8nio/n8n:2.47.5}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["sh", "/bootstrap/bootstrap.sh"]
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: "5432"
+      DB_POSTGRESDB_DATABASE: studio
+      DB_POSTGRESDB_USER: studio
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in .env}
+      # The public https address Telegram can reach. n8n registers the bot's webhook under it.
+      WEBHOOK_URL: ${WEBHOOK_URL}
+      N8N_WEBHOOK_URL: ${WEBHOOK_URL}
+      N8N_EDITOR_BASE_URL: ${WEBHOOK_URL}
+      N8N_PROXY_HOPS: "1"
+      GENERIC_TIMEZONE: ${STUDIO_TIMEZONE:-UTC}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_API_BASE: ${TELEGRAM_API_BASE:-https://api.telegram.org}
+      NOTIFIER_INTERVAL_SECONDS: ${NOTIFIER_INTERVAL_SECONDS:-}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/bootstrap/workflows:ro
+      - ./docker/bootstrap.sh:/bootstrap/bootstrap.sh:ro
+      - ./docker/prepare.mjs:/bootstrap/prepare.mjs:ro
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+
+volumes:
+  postgres_data:
+  n8n_data:

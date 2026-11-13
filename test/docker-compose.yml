@@ -1,0 +1,26 @@
+# Overlay for the end-to-end tests: the same stack as docker-compose.yml plus a
+# stand-in for the Telegram Bot API. Paths are relative to the repository root.
+#   npm run test:e2e
+
+services:
+  telegram:
+    image: node:22-alpine
+    command: ["node", "/app/mock-telegram.mjs"]
+    volumes:
+      - ./test/mock-telegram.mjs:/app/mock-telegram.mjs:ro
+    ports:
+      - "58081:8081"
+    mem_limit: 256m
+
+  postgres:
+    restart: "no"
+    ports:
+      - "55439:5432"
+    mem_limit: 512m
+
+  n8n:
+    restart: "no"
+    depends_on:
+      telegram:
+        condition: service_started
+    mem_limit: 1500m

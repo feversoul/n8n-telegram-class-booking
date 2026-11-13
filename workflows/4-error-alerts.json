@@ -1,0 +1,74 @@
+{
+  "name": "Studio Bot · 4 Error alerts",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Studio Bot · Error alerts\nWhen a run of one of the other workflows fails, the admins get a Telegram message about it (at most one per ten minutes for the same error).\n\nSwitch it on in each of the other three workflows: Settings, Error Workflow, pick this one.",
+        "width": 620,
+        "height": 220,
+        "color": 4
+      },
+      "id": "03fcca99-4764-458b-8fa3-970bea3edac7",
+      "name": "About",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -280
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "8bc18509-8f4a-4c5b-8a6e-5e7b9b4b21b2",
+      "name": "When a run fails",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.alert($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ workflow: $json.workflow?.name, node: $json.execution?.lastNodeExecuted, message: $json.execution?.error?.message ?? $json.trigger?.error?.message, url: $json.execution?.url }) }}"
+        }
+      },
+      "id": "50da34ab-afff-4f0a-8ba5-714ea6668585",
+      "name": "Queue alert",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When a run fails": {
+      "main": [
+        [
+          {
+            "node": "Queue alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "id": "studioBotErrors01"
+}

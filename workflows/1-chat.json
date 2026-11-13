@@ -1,0 +1,1283 @@
+{
+  "name": "Studio Bot · 1 Chat",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Studio Bot · Chat\nEvery message and button tap comes in on the left and leaves as a reply on the right.\n\n**Begin** drops repeated updates and looks up who is writing. **Route** picks the branch. Each branch is one call to a Postgres function that checks the role and does the work. **Render** writes the reply.\n\nThe words the bot says are in **Render**. The rules (no double bookings, who may do what) are in Postgres, in `db/install.sql`.\n\nTo act on an event, add nodes after a branch: for example after **Book** to post new classes somewhere else.",
+        "width": 640,
+        "height": 300,
+        "color": 4
+      },
+      "id": "023f83f0-f775-48e0-898e-64a24df5dab4",
+      "name": "About",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -60,
+        -500
+      ]
+    },
+    {
+      "parameters": {
+        "updates": [
+          "message",
+          "callback_query"
+        ],
+        "additionalFields": {}
+      },
+      "id": "fb1106d7-3227-485f-894e-d105eb4b6b38",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "f0185e10-0554-4d0c-8b03-dcfc65ff710b",
+      "credentials": {
+        "telegramApi": {
+          "id": "studioBotTelegram",
+          "name": "Studio Bot Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.begin($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json) }}"
+        }
+      },
+      "id": "d83404b0-5018-406a-82e2-000e2592bb6c",
+      "name": "Begin",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Shared by every Code node. scripts/build.mjs pastes this file in front of\n// route.js, render.js and notify.js, because n8n Code nodes cannot import.\n\nconst WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];\nconst MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];\n\n// Everything that came from a person or the database goes through esc()\n// before it is put into a message, because messages are sent as HTML.\nconst esc = (value) =>\n  String(value ?? '')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;');\n\n// Days travel as \"2026-11-14\" in data and as \"20261114\" inside buttons. They\n// are plain calendar dates in the studio's time zone; Postgres owns the clock.\nconst asDate = (iso) => new Date(`${iso}T00:00:00Z`);\nconst addDays = (iso, count) => {\n  const date = asDate(iso);\n  date.setUTCDate(date.getUTCDate() + count);\n  return date.toISOString().slice(0, 10);\n};\nconst dayName = (iso) => {\n  const date = asDate(iso);\n  return `${WEEKDAYS[date.getUTCDay()]} ${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]}`;\n};\nconst dayLabel = (iso, today) => {\n  if (iso === today) return `${dayName(iso)} (today)`;\n  if (iso === addDays(today, 1)) return `${dayName(iso)} (tomorrow)`;\n  return dayName(iso);\n};\nconst packDay = (iso) => iso.replace(/-/g, '');\nconst unpackDay = (packed) => {\n  if (!/^\\d{8}$/.test(packed ?? '')) return null;\n  const iso = `${packed.slice(0, 4)}-${packed.slice(4, 6)}-${packed.slice(6, 8)}`;\n  const date = asDate(iso);\n  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === iso ? iso : null;\n};\nconst packTime = (hhmm) => hhmm.replace(':', '');\nconst unpackTime = (packed) => {\n  if (!/^\\d{4}$/.test(packed ?? '')) return null;\n  const hours = Number(packed.slice(0, 2));\n  const minutes = Number(packed.slice(2, 4));\n  return hours < 24 && minutes < 60 ? `${packed.slice(0, 2)}:${packed.slice(2, 4)}` : null;\n};\n\nconst button = (text, data) => ({ text, callback_data: data });\nconst rowsOf = (items, perRow) => {\n  const rows = [];\n  for (let i = 0; i < items.length; i += perRow) rows.push(items.slice(i, i + perRow));\n  return rows;\n};\n\n// A booking or a move in progress is not stored anywhere. Each button carries\n// every choice made so far, for example \"b:c2:r1:d20261114:t0900\":\n//   c class type   r room (0 = ask)   d day   t start time\n//   p trainer (0 = ask)   n weeks to repeat   w week shown in the day picker\n// So there is no session to expire or to get out of step with the screen, and\n// \"Back\" is simply the same data with the last choice left out. Telegram\n// allows 64 bytes per button; the longest of these is under 50.\nconst STEP_KEYS = ['c', 'r', 'd', 't', 'p', 'n', 'w'];\nconst wizard = (base, steps) =>\n  [base]\n    .concat(\n      STEP_KEYS.filter((key) => steps[key] !== undefined && steps[key] !== null).map(\n        (key) => `${key}${steps[key]}`,\n      ),\n    )\n    .join(':');\nconst without = (steps, ...keys) =>\n  Object.fromEntries(Object.entries(steps).filter(([key]) => !keys.includes(key)));\nconst readSteps = (parts) => {\n  const steps = {};\n  for (const part of parts) {\n    const key = part[0];\n    const value = part.slice(1);\n    if (!STEP_KEYS.includes(key)) continue;\n    if (key === 'd' && unpackDay(value)) steps.d = value;\n    else if (key === 't' && unpackTime(value)) steps.t = value;\n    else if ('crpnw'.includes(key) && /^\\d{1,9}$/.test(value)) steps[key] = String(Number(value));\n  }\n  return steps;\n};\n// The \"Route\" Code node: turn one Telegram update into the name of a branch,\n// the screen to draw and the request for that branch's database function.\n// It decides where to go, never whether it is allowed: Postgres checks that.\n\nconst COMMANDS = {\n  start: 'h',\n  menu: 'h',\n  help: 'help',\n  schedule: 's',\n  today: 's',\n  book: 'b',\n  my: 'm',\n  calendar: 'cal',\n  people: 'pl',\n  rooms: 'ro',\n  classtypes: 'cl',\n};\n\nfunction route(update, begin) {\n  if (!begin || begin.skip) return null;\n  const tap = update.callback_query;\n  const message = tap ? tap.message : update.message;\n  if (!message || !message.chat) return null;\n\n  const me = begin.me;\n  const reply = {\n    chat_id: message.chat.id,\n    message_id: tap ? message.message_id : null,\n    callback_id: tap ? tap.id : null,\n  };\n  const go = (branch, screen, req = {}, extra = {}) => ({\n    branch,\n    screen,\n    req: { tg: me.tg, ...req },\n    reply,\n    ...extra,\n  });\n\n  if (me.status !== 'active') return go('home', me.status);\n\n  let action;\n  if (tap) {\n    action = String(tap.data || 'h');\n  } else {\n    const text = String(message.text || '').trim();\n    if (text.startsWith('/')) {\n      action = COMMANDS[text.slice(1).split(/[\\s@]/)[0].toLowerCase()] || 'unknown';\n    } else if (begin.awaiting && text) {\n      return go('manage', 'manage', { op: 'input', text: text.slice(0, 200) });\n    } else {\n      return go('home', 'home', {}, { hint: 'unknown' });\n    }\n  }\n\n  const parts = action.split(':');\n  const head = parts[0];\n  const id = (index) => (/^\\d{1,15}$/.test(parts[index] || '') ? Number(parts[index]) : null);\n\n  switch (head) {\n    case 'h':\n      return go('home', 'home');\n    case 'help':\n      return go('home', 'help');\n\n    case 's': {\n      const day = unpackDay(parts[1]);\n      return go('schedule', parts[2] === 'm' ? 'day_classes' : 'schedule', day ? { day } : {});\n    }\n\n    // Booking: \"b:...\" shows the next question, \"B:...\" commits.\n    case 'b':\n    case 'B': {\n      const steps = readSteps(parts.slice(1));\n      const wiz = { base: 'b', steps };\n      const req = {};\n      if (steps.c) req.class = Number(steps.c);\n      if (steps.r && steps.r !== '0') req.room = Number(steps.r);\n      if (steps.d) req.day = unpackDay(steps.d);\n      if (steps.t) req.time = unpackTime(steps.t);\n      if (steps.p && steps.p !== '0') req.trainer = Number(steps.p);\n      if (steps.w) req.week = Number(steps.w);\n      const complete = req.class && req.room && req.day && req.time;\n      if (head === 'B' && complete) {\n        return go('book', 'booked', { ...req, repeat: steps.n ? Number(steps.n) : 1 }, { wiz });\n      }\n      if (steps.p === '0') return go('options', 'book_trainer', req, { wiz });\n      if (!req.class) return go('options', 'book_class', req, { wiz });\n      if (!req.room) return go('options', 'book_room', req, { wiz });\n      if (!req.day) return go('days', 'book_day', req, { wiz });\n      if (!req.time) return go('slots', 'book_time', req, { wiz });\n      return go('preview', 'book_confirm', req, { wiz });\n    }\n\n    // Moving a class: \"e:<id>:...\" asks, \"E:<id>:...\" commits.\n    case 'e':\n    case 'E': {\n      const booking = id(1);\n      if (!booking) return go('home', 'home', {}, { hint: 'unknown' });\n      const steps = without(readSteps(parts.slice(2)), 'c', 'p', 'n');\n      const wiz = { base: `e:${booking}`, steps };\n      const req = { booking };\n      if (steps.r && steps.r !== '0') req.room = Number(steps.r);\n      if (steps.d) req.day = unpackDay(steps.d);\n      if (steps.t) req.time = unpackTime(steps.t);\n      if (steps.w) req.week = Number(steps.w);\n      if (head === 'E' && req.day && req.time) return go('reschedule', 'moved', req, { wiz });\n      if (steps.r === '0') return go('options', 'move_room', { booking }, { wiz });\n      if (!req.day) return go('days', 'move_day', req, { wiz });\n      if (!req.time) return go('slots', 'move_time', req, { wiz });\n      return go('preview', 'move_confirm', req, { wiz });\n    }\n\n    case 'm':\n      return go('bookings', 'mine', { page: id(1) || 0 });\n    case 'v':\n      return id(1) ? go('booking', 'view', { id: id(1) }) : go('home', 'home');\n    case 'x':\n      return id(1) ? go('booking', 'cancel_confirm', { id: id(1) }) : go('home', 'home');\n    case 'X':\n      return id(1)\n        ? go('cancel', 'cancelled', { id: id(1), following: parts[2] === 'f' })\n        : go('home', 'home');\n\n    case 'pl':\n      return go('people', 'people', { op: 'list' });\n    case 'pv':\n      return go('people', 'person', { op: 'view', id: id(1) });\n    case 'ps':\n      return go('people', 'person', { op: 'set', id: id(1), action: parts[2] });\n\n    case 'ro':\n      return go('manage', 'manage', { op: 'rooms' });\n    case 'rt':\n      return go('manage', 'manage', { op: 'room_toggle', id: id(1) });\n    case 'rn':\n      return go('manage', 'ask', { op: 'ask', awaiting: 'room_new' });\n    case 'rr':\n      return go('manage', 'ask', { op: 'ask', awaiting: 'room_rename', id: id(1) });\n    case 'cl':\n      return go('manage', 'manage', { op: 'classes' });\n    case 'ct':\n      return go('manage', 'manage', { op: 'class_toggle', id: id(1) });\n    case 'cn':\n      return go('manage', 'ask', { op: 'ask', awaiting: 'class_new' });\n\n    case 'cal':\n      return go('calendar', 'calendar');\n    default:\n      return go('home', 'home', {}, { hint: 'unknown' });\n  }\n}\n\nconst routed = route($('Telegram Trigger').first().json, $input.first().json.data);\n// Nothing to do for a repeated update or a group chat: the run ends here.\nreturn routed ? [{ json: routed }] : [];"
+      },
+      "id": "e8bd4ed2-f50d-4d88-83c7-dc55461085a5",
+      "name": "Route",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "7817e47a-d5f0-413e-8b83-865c38b2ecb0",
+                    "leftValue": "={{ $json.branch }}",
+                    "rightValue": "home",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Menu"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "bdcba468-2c79-4780-8297-f95f410a98a9",
+                    "leftValue": "={{ $json.branch }}",
+                    "rightValue": "schedule",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Schedule"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "141e174b-6ece-491d-81b9-bef471571ee1",
+                    "leftValue": "={{ $json.branch }}",
+                    "rightValue": "options",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Options"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "d7dbadab-5cfb-438e-89d1-676953798abd",
+                    "leftValue": "={{ $json.branch }}",
+                    "rightValue": "days",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Days"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "7ca1a5ab-08a2-4609-824f-086b1b5d1c6f",
+                    "leftValue": "={{ $json.branch }}",
+                    "rightValue": "slots",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Free times"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "c998c01d-b5d6-4379-8340-aabd258738b9",
+                    "leftValue": "={{ $json.branch }}",
+                    "rightValue": "preview",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Preview"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "260ebcd6-dcbb-4646-8619-645a50e4411b",
+                    "leftValue": "={{ $json.branch }}",
+                    "rightValue": "book",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Book"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "3a05f079-2408-418e-81e3-d141ccb2ea5f",
+                    "leftValue": "={{ $json.branch }}",
+                    "rightValue": "bookings",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "My classes"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "9ed3e2ca-716d-471b-868a-de16fc0f6e85",
+                    "leftValue": "={{ $json.branch }}",
+                    "rightValue": "booking",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Class"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "df721625-0c89-45e6-8425-06c3a8f35548",
+                    "leftValue": "={{ $json.branch }}",
+                    "rightValue": "cancel",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Cancel"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "a1f753af-fe6b-420c-88ad-34a8bfe276e2",
+                    "leftValue": "={{ $json.branch }}",
+                    "rightValue": "reschedule",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Move"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "1f8a3681-7082-4400-8fe4-093a90f2f925",
+                    "leftValue": "={{ $json.branch }}",
+                    "rightValue": "people",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "People"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "d86e1f6b-b06d-4eaf-813a-2d675249731c",
+                    "leftValue": "={{ $json.branch }}",
+                    "rightValue": "manage",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Rooms and class types"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "0509b837-02a7-4a7e-829e-9b50ed8fd3c6",
+                    "leftValue": "={{ $json.branch }}",
+                    "rightValue": "calendar",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Calendar links"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "3368e757-0277-4318-8ac2-0c49db2530be",
+      "name": "Branch",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Shared by every Code node. scripts/build.mjs pastes this file in front of\n// route.js, render.js and notify.js, because n8n Code nodes cannot import.\n\nconst WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];\nconst MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];\n\n// Everything that came from a person or the database goes through esc()\n// before it is put into a message, because messages are sent as HTML.\nconst esc = (value) =>\n  String(value ?? '')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;');\n\n// Days travel as \"2026-11-14\" in data and as \"20261114\" inside buttons. They\n// are plain calendar dates in the studio's time zone; Postgres owns the clock.\nconst asDate = (iso) => new Date(`${iso}T00:00:00Z`);\nconst addDays = (iso, count) => {\n  const date = asDate(iso);\n  date.setUTCDate(date.getUTCDate() + count);\n  return date.toISOString().slice(0, 10);\n};\nconst dayName = (iso) => {\n  const date = asDate(iso);\n  return `${WEEKDAYS[date.getUTCDay()]} ${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]}`;\n};\nconst dayLabel = (iso, today) => {\n  if (iso === today) return `${dayName(iso)} (today)`;\n  if (iso === addDays(today, 1)) return `${dayName(iso)} (tomorrow)`;\n  return dayName(iso);\n};\nconst packDay = (iso) => iso.replace(/-/g, '');\nconst unpackDay = (packed) => {\n  if (!/^\\d{8}$/.test(packed ?? '')) return null;\n  const iso = `${packed.slice(0, 4)}-${packed.slice(4, 6)}-${packed.slice(6, 8)}`;\n  const date = asDate(iso);\n  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === iso ? iso : null;\n};\nconst packTime = (hhmm) => hhmm.replace(':', '');\nconst unpackTime = (packed) => {\n  if (!/^\\d{4}$/.test(packed ?? '')) return null;\n  const hours = Number(packed.slice(0, 2));\n  const minutes = Number(packed.slice(2, 4));\n  return hours < 24 && minutes < 60 ? `${packed.slice(0, 2)}:${packed.slice(2, 4)}` : null;\n};\n\nconst button = (text, data) => ({ text, callback_data: data });\nconst rowsOf = (items, perRow) => {\n  const rows = [];\n  for (let i = 0; i < items.length; i += perRow) rows.push(items.slice(i, i + perRow));\n  return rows;\n};\n\n// A booking or a move in progress is not stored anywhere. Each button carries\n// every choice made so far, for example \"b:c2:r1:d20261114:t0900\":\n//   c class type   r room (0 = ask)   d day   t start time\n//   p trainer (0 = ask)   n weeks to repeat   w week shown in the day picker\n// So there is no session to expire or to get out of step with the screen, and\n// \"Back\" is simply the same data with the last choice left out. Telegram\n// allows 64 bytes per button; the longest of these is under 50.\nconst STEP_KEYS = ['c', 'r', 'd', 't', 'p', 'n', 'w'];\nconst wizard = (base, steps) =>\n  [base]\n    .concat(\n      STEP_KEYS.filter((key) => steps[key] !== undefined && steps[key] !== null).map(\n        (key) => `${key}${steps[key]}`,\n      ),\n    )\n    .join(':');\nconst without = (steps, ...keys) =>\n  Object.fromEntries(Object.entries(steps).filter(([key]) => !keys.includes(key)));\nconst readSteps = (parts) => {\n  const steps = {};\n  for (const part of parts) {\n    const key = part[0];\n    const value = part.slice(1);\n    if (!STEP_KEYS.includes(key)) continue;\n    if (key === 'd' && unpackDay(value)) steps.d = value;\n    else if (key === 't' && unpackTime(value)) steps.t = value;\n    else if ('crpnw'.includes(key) && /^\\d{1,9}$/.test(value)) steps[key] = String(Number(value));\n  }\n  return steps;\n};\n// The \"Render\" Code node: turn the routed request and the database answer\n// into Telegram API calls. Every word the bot says is in this file (and in\n// notify.js), so this is the place to translate or reword.\n//\n// A screen returns { text, rows, toast }. Taps edit the message they came\n// from, so a whole booking happens in one message instead of a long scroll.\n\nconst MENU = [button('Menu', 'h')];\n\nconst REFUSALS = {\n  forbidden: 'That is not available for your role.',\n  not_found: 'That item no longer exists.',\n  closed: 'That class has started, finished or been cancelled, so it can no longer be changed.',\n  class_gone: 'That class type is no longer offered.',\n  room_gone: 'That room is no longer available. Pick another room.',\n  trainer_gone: 'That trainer no longer has access.',\n  bad_slot: 'That start time can no longer be booked.',\n  last_admin: 'The studio needs at least one admin. Make someone else an admin first.',\n  no_calendar: 'The calendar feed is not switched on for this studio.',\n};\n\nconst span = (b) => `${b.from}–${b.to}`;\n\n// The card that describes one class, used on every screen that shows one.\nfunction card(b, today) {\n  return [\n    `<b>${esc(b.class)}</b> · ${b.minutes} min`,\n    `Room: ${esc(b.room)}`,\n    `When: ${dayLabel(b.day, today)}, ${span(b)}`,\n    `Trainer: ${esc(b.trainer)}`,\n  ].join('\\n');\n}\n\nfunction planCard(d, today) {\n  return card(\n    {\n      class: d.plan.class.name,\n      minutes: d.plan.minutes,\n      room: d.plan.room.name,\n      trainer: d.plan.trainer.name,\n      day: d.day,\n      from: d.from,\n      to: d.to,\n    },\n    today,\n  );\n}\n\n// The lines above a question in the booking and moving flows.\nfunction planHead(plan) {\n  const lines = [`${esc(plan.class.name)} · ${plan.minutes} min`];\n  if (plan.room) lines.push(`Room: ${esc(plan.room.name)}`);\n  if (!plan.trainer.self) lines.push(`Trainer: ${esc(plan.trainer.name)}`);\n  return lines.join('\\n');\n}\n\nfunction dayButtons(ctx, d, backData) {\n  const { base, steps } = ctx.wiz;\n  const open = d.days.filter((day) => day.free > 0);\n  const rows = rowsOf(\n    open.map((day) =>\n      button(\n        `${dayName(day.day)} · ${day.free} free`,\n        wizard(base, { ...without(steps, 'w', 't'), d: packDay(day.day) }),\n      ),\n    ),\n    2,\n  );\n  const paging = [];\n  if (d.week > 0) paging.push(button('‹ Earlier', wizard(base, { ...without(steps, 'd', 't'), w: d.week - 1 })));\n  if (d.more) paging.push(button('Later ›', wizard(base, { ...without(steps, 'd', 't'), w: d.week + 1 })));\n  if (paging.length) rows.push(paging);\n  const full = d.days.filter((day) => day.free === 0).map((day) => dayName(day.day));\n  return { rows, full, any: open.length > 0, backData };\n}\n\nfunction timeButtons(ctx, slots) {\n  const { base, steps } = ctx.wiz;\n  return rowsOf(\n    slots.map((time) => button(time, wizard(base, { ...without(steps, 'n', 'w'), t: packTime(time) }))),\n    4,\n  );\n}\n\n// Somebody else got there first. The choices made so far are still in the\n// button data, so the same room and day are offered again with fresh times.\nfunction taken(ctx, d) {\n  const { base, steps } = ctx.wiz;\n  const when = `${d.time} on ${dayName(d.day)}`;\n  const reason =\n    d.why === 'trainer'\n      ? `${esc(d.plan.trainer.self ? 'You are' : `${d.plan.trainer.name} is`)} already teaching at ${when}.`\n      : `${esc(d.plan.room.name)} was booked for ${when} a moment ago.`;\n  const rows = timeButtons(ctx, d.slots);\n  rows.push([button('Another day', wizard(base, without(steps, 'd', 't', 'n', 'w')))]);\n  rows.push(base === 'b' ? [button('✖ Cancel', 'h')] : [button('✖ Keep as is', `v:${d.plan.booking.id}`)]);\n  return {\n    text: [\n      '<b>Just taken</b>',\n      reason,\n      '',\n      d.slots.length ? 'These start times are still free that day:' : 'Nothing else is free that day.',\n    ].join('\\n'),\n    rows,\n    toast: 'That time was just taken',\n  };\n}\n\nconst SCREENS = {\n  home(ctx) {\n    const { me, studio } = ctx.begin;\n    const admin = me.role === 'admin';\n    const lines = [];\n    if (ctx.route.hint === 'unknown') lines.push('I did not understand that. Use the buttons below.', '');\n    lines.push(`<b>${esc(studio.name)}</b>`);\n    lines.push(`Hi ${esc(me.name)}. You are signed in as ${admin ? 'an admin' : 'a trainer'}.`);\n    if (me.is_new && admin) {\n      lines.push('', 'You are the first person here, so you are the admin. Everyone who starts this bot after you waits for your approval.');\n    }\n    const missing = [studio.rooms === 0 && 'a room', studio.classes === 0 && 'a class type'].filter(Boolean);\n    if (missing.length) {\n      lines.push('', admin\n        ? `Before anyone can book, add ${missing.join(' and ')} with the buttons below.`\n        : 'The studio is not ready for bookings yet: an admin still has to add rooms and class types.');\n    }\n    const rows = [\n      [button('📅 Schedule', 's'), button('➕ Book a class', 'b')],\n      [button('🗂 My classes', 'm')].concat(studio.calendar ? [button('🔗 Calendar', 'cal')] : []),\n    ];\n    if (admin) rows.push([button('👥 People', 'pl'), button('🚪 Rooms', 'ro'), button('🏷 Class types', 'cl')]);\n    return { text: lines.join('\\n'), rows };\n  },\n\n  help(ctx) {\n    const admin = ctx.begin.me.role === 'admin';\n    const lines = [\n      '<b>What this bot does</b>',\n      '/schedule shows every room for a day, with the free times',\n      '/book books a room for a class, once or weekly',\n      '/my lists your upcoming classes, to move or cancel them',\n      '/calendar gives links for Google, Apple or Outlook calendars',\n      '',\n      'A room is never booked twice and you are never booked in two rooms at once. You get a reminder before each class.',\n    ];\n    if (admin) {\n      lines.push('', '<b>Admins</b>', '/people lets people in and sets their role', '/rooms and /classtypes set up the studio', 'Admins can book for any trainer and move or cancel any class.');\n    } else {\n      lines.push('', 'Trainers can move and cancel their own classes. Admins can change any class.');\n    }\n    return { text: lines.join('\\n'), rows: [MENU] };\n  },\n\n  pending(ctx) {\n    return {\n      text: `Thanks, ${esc(ctx.begin.me.name)}. Your request to use this bot went to the studio admins. You will get a message here as soon as one of them lets you in.`,\n      rows: [],\n    };\n  },\n\n  blocked() {\n    return { text: 'Your access to this bot is switched off. Ask a studio admin if that is a mistake.', rows: [] };\n  },\n\n  schedule(ctx, d) {\n    const admin = ctx.begin.me.role === 'admin';\n    const lines = [`<b>${dayLabel(d.day, ctx.today)}</b>`];\n    lines.push(d.closed ? 'The studio is closed on this day.' : `Open ${d.opens}–${d.closes}`);\n    if (!d.rooms.length) lines.push('', admin ? 'There are no rooms yet. Add one under Rooms in the menu.' : 'There are no rooms yet.');\n    let classes = 0;\n    for (const room of d.rooms) {\n      lines.push('', `<b>${esc(room.name)}</b>${room.capacity ? ` · up to ${room.capacity}` : ''}`);\n      for (const c of room.classes) {\n        classes += 1;\n        lines.push(`${span(c)}  ${esc(c.class)} · ${c.mine ? 'you' : esc(c.trainer)}`);\n      }\n      if (!room.classes.length) lines.push('No classes');\n      if (!d.past && !d.closed) {\n        lines.push(room.free.length ? `Free: ${room.free.map(span).join(', ')}` : 'Free: nothing left');\n      }\n    }\n    const rows = [[button(`‹ ${dayName(addDays(d.day, -1))}`, `s:${packDay(addDays(d.day, -1))}`)]];\n    if (d.day !== ctx.today) rows[0].push(button('Today', 's'));\n    rows[0].push(button(`${dayName(addDays(d.day, 1))} ›`, `s:${packDay(addDays(d.day, 1))}`));\n    if (d.bookable && d.rooms.length) rows.push([button(`➕ Book on ${dayName(d.day)}`, `b:d${packDay(d.day)}`)]);\n    if (classes) rows.push([button('Open a class', `s:${packDay(d.day)}:m`)]);\n    rows.push(MENU);\n    return { text: lines.join('\\n'), rows };\n  },\n\n  day_classes(ctx, d) {\n    const items = d.rooms.flatMap((room) => room.classes).sort((a, b) => a.from.localeCompare(b.from));\n    const rows = items.slice(0, 40).map((c) => [\n      button(`${c.from} ${c.class} · ${c.room} · ${c.mine ? 'you' : c.trainer}`.slice(0, 60), `v:${c.id}`),\n    ]);\n    rows.push([button('‹ Back', `s:${packDay(d.day)}`)]);\n    return {\n      text: `<b>${dayLabel(d.day, ctx.today)}</b>\\n${items.length ? 'Which class do you want to open?' : 'No classes on this day.'}`,\n      rows,\n    };\n  },\n\n  book_class(ctx, d) {\n    const { steps } = ctx.wiz;\n    const day = steps.d ? unpackDay(steps.d) : null;\n    const lines = [`<b>New class</b>${day ? ` on ${dayLabel(day, ctx.today)}` : ''}`];\n    if (!d.classes.length || !d.rooms.length) {\n      lines.push('', ctx.begin.me.role === 'admin'\n        ? 'Add at least one room and one class type first, from the menu.'\n        : 'The studio is not ready for bookings yet: an admin still has to add rooms and class types.');\n      return { text: lines.join('\\n'), rows: [MENU] };\n    }\n    lines.push('', 'What are you teaching?');\n    const rows = rowsOf(\n      d.classes.map((c) => button(`${c.name} · ${c.minutes} min`, wizard('b', { ...steps, c: c.id }))),\n      2,\n    );\n    rows.push([button('✖ Cancel', 'h')]);\n    return { text: lines.join('\\n'), rows };\n  },\n\n  book_room(ctx, d) {\n    const { steps } = ctx.wiz;\n    const chosen = d.classes.find((c) => String(c.id) === steps.c);\n    if (!chosen) return refusal({ error: 'class_gone' });\n    const rows = rowsOf(\n      d.rooms.map((room) =>\n        button(`${room.name}${room.capacity ? ` (${room.capacity})` : ''}`, wizard('b', { ...steps, r: room.id })),\n      ),\n      2,\n    );\n    rows.push([button('‹ Back', wizard('b', without(steps, 'c'))), button('✖ Cancel', 'h')]);\n    return {\n      text: `<b>New class</b>\\n${esc(chosen.name)} · ${chosen.minutes} min\\n\\nWhich room?`,\n      rows,\n    };\n  },\n\n  book_trainer(ctx, d) {\n    const { steps } = ctx.wiz;\n    const rows = rowsOf(\n      d.trainers.map((t) => button(t.self ? `${t.name} (you)` : t.name, wizard('b', { ...steps, p: t.id }))),\n      2,\n    );\n    rows.push([button('‹ Back', wizard('b', without(steps, 'p')))]);\n    return { text: '<b>New class</b>\\n\\nWho teaches it?', rows };\n  },\n\n  book_day(ctx, d) {\n    const { steps } = ctx.wiz;\n    const days = dayButtons(ctx, d);\n    const lines = ['<b>New class</b>', planHead(d.plan), ''];\n    lines.push(days.any ? 'Which day?' : 'No free start times in these days.');\n    if (days.full.length && days.any) lines.push(`Full or closed: ${days.full.join(', ')}`);\n    days.rows.push([button('‹ Back', wizard('b', without(steps, 'r', 'd', 't', 'w'))), button('✖ Cancel', 'h')]);\n    return { text: lines.join('\\n'), rows: days.rows };\n  },\n\n  book_time(ctx, d) {\n    const { steps } = ctx.wiz;\n    const lines = ['<b>New class</b>', planHead(d.plan), `Day: ${dayLabel(d.day, ctx.today)}`, ''];\n    lines.push(d.slots.length ? 'Pick a start time.' : 'No free start times on this day.');\n    if (d.trainer_busy > 0) {\n      lines.push(`${d.trainer_busy} more are hidden because ${d.plan.trainer.self ? 'you teach' : `${esc(d.plan.trainer.name)} teaches`} somewhere else then.`);\n    }\n    const rows = timeButtons(ctx, d.slots);\n    rows.push([button('‹ Back', wizard('b', without(steps, 'd', 't'))), button('✖ Cancel', 'h')]);\n    return { text: lines.join('\\n'), rows };\n  },\n\n  book_confirm(ctx, d) {\n    const { steps } = ctx.wiz;\n    const back = button('‹ Back', wizard('b', without(steps, 't', 'n')));\n    if (!d.free) {\n      return {\n        text: `<b>That time is no longer free</b>\\n${d.why === 'trainer' ? 'The trainer is teaching somewhere else then.' : 'The room has been booked.'}\\n\\n${planCard(d, ctx.today)}`,\n        rows: [[button('Pick another time', wizard('b', without(steps, 't', 'n')))], [button('✖ Cancel', 'h')]],\n      };\n    }\n    const commit = (weeks) => wizard('B', weeks ? { ...steps, n: weeks } : without(steps, 'n'));\n    const rows = [\n      [button('✅ Book it', commit(0))],\n      [button('Weekly × 4', commit(4)), button('× 8', commit(8)), button('× 12', commit(12))],\n    ];\n    if (d.is_admin) rows.push([button('👤 Change trainer', wizard('b', { ...steps, p: '0' }))]);\n    rows.push([back, button('✖ Cancel', 'h')]);\n    return {\n      text: `<b>Book this class?</b>\\n\\n${planCard(d, ctx.today)}\\n\\nBook it once, or the same time every week.`,\n      rows,\n    };\n  },\n\n  booked(ctx, d) {\n    if (d.ok === false) return taken(ctx, d);\n    const first = d.booked[0];\n    const rows = [\n      [button('Open class', `v:${first.id}`), button('➕ Book another', 'b')],\n      [button('📅 That day', `s:${packDay(first.day)}`), button('Menu', 'h')],\n    ];\n    if (d.weeks === 1) return { text: `<b>Booked</b>\\n\\n${card(first, ctx.today)}`, rows, toast: 'Booked' };\n    const reasons = { room: 'room already booked', trainer: 'trainer teaching elsewhere', closed: 'studio closed' };\n    const lines = [\n      `<b>Booked ${d.booked.length} of ${d.weeks} weekly classes</b>`,\n      '',\n      `<b>${esc(first.class)}</b> · ${first.minutes} min`,\n      `Room: ${esc(first.room)}`,\n      `Time: ${span(first)}`,\n      `Trainer: ${esc(first.trainer)}`,\n      '',\n      `Booked: ${d.booked.map((b) => dayName(b.day)).join(', ')}`,\n    ];\n    if (d.skipped.length) {\n      lines.push('', 'Not booked:');\n      for (const skip of d.skipped) lines.push(`${dayName(skip.day)}: ${reasons[skip.why] || skip.why}`);\n    }\n    return { text: lines.join('\\n'), rows, toast: `Booked ${d.booked.length} classes` };\n  },\n\n  mine(ctx, d) {\n    const lines = ['<b>My classes</b>'];\n    lines.push(d.total ? `${d.total} upcoming. Open one to move or cancel it.` : 'You have no upcoming classes.');\n    const rows = d.items.map((b) => [\n      button(`${dayName(b.day)} ${b.from} · ${b.class} · ${b.room}`.slice(0, 60), `v:${b.id}`),\n    ]);\n    const paging = [];\n    if (d.page > 0) paging.push(button('‹ Earlier', `m:${d.page - 1}`));\n    if (d.more) paging.push(button('Later ›', `m:${d.page + 1}`));\n    if (paging.length) rows.push(paging);\n    rows.push([button('➕ Book a class', 'b'), button('Menu', 'h')]);\n    return { text: lines.join('\\n'), rows };\n  },\n\n  view(ctx, d) {\n    const b = d.booking;\n    const lines = [card(b, ctx.today)];\n    if (b.status === 'cancelled') lines.push('', 'This class was cancelled.');\n    else if (!b.upcoming) lines.push('', 'This class has started or finished.');\n    else if (b.following > 0) lines.push('', `Part of a weekly series: ${b.following} more after this one.`);\n    const rows = [];\n    if (b.can_edit) rows.push([button('🕑 Move', `e:${b.id}`), button('🗑 Cancel class', `x:${b.id}`)]);\n    rows.push([button('📅 That day', `s:${packDay(b.day)}`), button('🗂 My classes', 'm')]);\n    rows.push(MENU);\n    return { text: lines.join('\\n'), rows };\n  },\n\n  cancel_confirm(ctx, d) {\n    const b = d.booking;\n    if (!b.can_edit) return SCREENS.view(ctx, d);\n    const rows = [[button('Yes, cancel it', `X:${b.id}`)]];\n    if (b.following > 0) rows.push([button(`Cancel it and the ${b.following} after it`, `X:${b.id}:f`)]);\n    rows.push([button('‹ Keep it', `v:${b.id}`)]);\n    return { text: `<b>Cancel this class?</b>\\n\\n${card(b, ctx.today)}`, rows };\n  },\n\n  cancelled(ctx, d) {\n    const b = d.booking;\n    const title = d.already\n      ? 'This class was already cancelled'\n      : d.count > 1\n        ? `Cancelled ${d.count} classes, starting with`\n        : 'Cancelled';\n    return {\n      text: `<b>${title}</b>\\n\\n${card(b, ctx.today)}`,\n      rows: [[button('📅 That day', `s:${packDay(b.day)}`), button('🗂 My classes', 'm')], MENU],\n      toast: d.already ? 'Already cancelled' : 'Cancelled',\n    };\n  },\n\n  move_room(ctx, d) {\n    const { base, steps } = ctx.wiz;\n    const b = d.plan.booking;\n    const rows = rowsOf(\n      d.rooms.map((room) =>\n        button(\n          `${room.name}${room.id === b.room_id ? ' (now)' : ''}`,\n          wizard(base, { ...without(steps, 'd', 't', 'w'), r: room.id }),\n        ),\n      ),\n      2,\n    );\n    rows.push([button('‹ Back', wizard(base, without(steps, 'r')))]);\n    return { text: `<b>Move class</b>\\n${card(b, ctx.today)}\\n\\nWhich room?`, rows };\n  },\n\n  move_day(ctx, d) {\n    const { base, steps } = ctx.wiz;\n    const b = d.plan.booking;\n    const days = dayButtons(ctx, d);\n    const lines = ['<b>Move class</b>', card(b, ctx.today), ''];\n    if (d.plan.room.id !== b.room_id) lines.push(`New room: ${esc(d.plan.room.name)}`);\n    lines.push(days.any ? 'Which day?' : 'No free start times in these days.');\n    if (days.full.length && days.any) lines.push(`Full or closed: ${days.full.join(', ')}`);\n    days.rows.push([button('🚪 Change room', wizard(base, { ...without(steps, 'd', 't', 'w'), r: '0' }))]);\n    days.rows.push([button('✖ Keep as is', `v:${b.id}`)]);\n    return { text: lines.join('\\n'), rows: days.rows };\n  },\n\n  move_time(ctx, d) {\n    const { base, steps } = ctx.wiz;\n    const b = d.plan.booking;\n    const lines = ['<b>Move class</b>', card(b, ctx.today), ''];\n    if (d.plan.room.id !== b.room_id) lines.push(`New room: ${esc(d.plan.room.name)}`);\n    lines.push(`New day: ${dayLabel(d.day, ctx.today)}`, '');\n    lines.push(d.slots.length ? 'Pick the new start time.' : 'No free start times on this day.');\n    const rows = timeButtons(ctx, d.slots);\n    rows.push([button('‹ Back', wizard(base, without(steps, 'd', 't'))), button('✖ Keep as is', `v:${b.id}`)]);\n    return { text: lines.join('\\n'), rows };\n  },\n\n  move_confirm(ctx, d) {\n    const { base, steps } = ctx.wiz;\n    const b = d.plan.booking;\n    const target = `${dayLabel(d.day, ctx.today)}, ${d.from}–${d.to} · ${esc(d.plan.room.name)}`;\n    const current = `${dayLabel(b.day, ctx.today)}, ${span(b)} · ${esc(b.room)}`;\n    const back = wizard(base, without(steps, 't'));\n    if (!d.free) {\n      return {\n        text: `<b>That time is no longer free</b>\\n${target}`,\n        rows: [[button('Pick another time', back)], [button('✖ Keep as is', `v:${b.id}`)]],\n      };\n    }\n    return {\n      text: [\n        '<b>Move this class?</b>',\n        '',\n        `<b>${esc(b.class)}</b> · ${b.minutes} min · ${esc(b.trainer)}`,\n        `From: ${current}`,\n        `To: ${target}`,\n      ].join('\\n'),\n      rows: [\n        [button('✅ Move it', wizard(`E:${b.id}`, steps))],\n        [button('‹ Back', back), button('✖ Keep as is', `v:${b.id}`)],\n      ],\n    };\n  },\n\n  moved(ctx, d) {\n    if (d.ok === false) return taken(ctx, d);\n    const b = d.booking;\n    const lines = [`<b>${d.already ? 'Nothing to change' : 'Moved'}</b>`, '', card(b, ctx.today)];\n    if (!d.already) lines.push('', `Was: ${dayLabel(d.was.day, ctx.today)}, ${span(d.was)} · ${esc(d.was.room)}`);\n    return {\n      text: lines.join('\\n'),\n      rows: [[button('Open class', `v:${b.id}`), button('📅 That day', `s:${packDay(b.day)}`)], MENU],\n      toast: d.already ? 'Same time as before' : 'Moved',\n    };\n  },\n\n  people(ctx, d) {\n    const waiting = d.people.filter((p) => p.status === 'pending').length;\n    const label = (p) => {\n      if (p.status === 'pending') return `⏳ ${p.name} · wants access`;\n      if (p.status === 'blocked') return `⛔ ${p.name} · blocked`;\n      return `${p.name} · ${p.role}${p.self ? ' (you)' : ''}`;\n    };\n    const rows = d.people.slice(0, 60).map((p) => [button(label(p).slice(0, 60), `pv:${p.id}`)]);\n    rows.push(MENU);\n    return {\n      text: `<b>People</b>\\n${waiting ? `${waiting} waiting to be let in.` : 'Nobody is waiting.'} Open a person to change their access.`,\n      rows,\n    };\n  },\n\n  person(ctx, d) {\n    const p = d.person;\n    const state =\n      p.status === 'pending' ? 'Waiting to be let in' : p.status === 'blocked' ? 'Blocked' : p.role === 'admin' ? 'Admin' : 'Trainer';\n    const lines = [`<b>${esc(p.name)}</b>${p.username ? ` (@${esc(p.username)})` : ''}${p.self ? ' · you' : ''}`, state];\n    if (p.upcoming > 0) lines.push(`Upcoming classes: ${p.upcoming}`);\n    if (p.status === 'blocked' && p.upcoming > 0) lines.push('Their classes stay on the schedule until you move or cancel them.');\n    const set = (text, action) => [button(text, `ps:${p.id}:${action}`)];\n    const rows = [];\n    if (p.status === 'pending') rows.push(set('✅ Let in as trainer', 'trainer'), set('Let in as admin', 'admin'), set('⛔ Block', 'block'));\n    else if (p.status === 'blocked') rows.push(set('Unblock as trainer', 'trainer'));\n    else if (p.role === 'admin') rows.push(set('Make trainer', 'trainer'), set('⛔ Block', 'block'));\n    else rows.push(set('Make admin', 'admin'), set('⛔ Block', 'block'));\n    rows.push([button('‹ People', 'pl')]);\n    const toasts = { trainer: 'Now a trainer', admin: 'Now an admin', blocked: 'Blocked' };\n    return { text: lines.join('\\n'), rows, toast: toasts[d.note] };\n  },\n\n  ask(ctx, d) {\n    return { text: question(d.asking, d.current), rows: [[button('✖ Cancel', d.asking === 'class_new' ? 'cl' : 'ro')]] };\n  },\n\n  manage(ctx, d) {\n    if (d.ok === false) {\n      const problem =\n        d.error === 'duplicate'\n          ? `There is already one called <b>${esc(d.name)}</b>.`\n          : 'I could not read that.';\n      return {\n        text: `${problem}\\n\\n${question(d.asking)}`,\n        rows: [[button('✖ Cancel', d.asking === 'class_new' ? 'cl' : 'ro')]],\n      };\n    }\n    if (d.list === 'rooms') {\n      const lines = ['<b>Rooms</b>'];\n      if (!d.rooms.length) lines.push('No rooms yet.');\n      for (const room of d.rooms) {\n        const facts = [room.capacity ? `up to ${room.capacity}` : null, room.upcoming ? `${room.upcoming} upcoming` : null, room.active ? null : 'off']\n          .filter(Boolean)\n          .join(' · ');\n        lines.push(`${esc(room.name)}${facts ? ` · ${facts}` : ''}`);\n      }\n      if (d.rooms.length) lines.push('', 'Tap a room to switch it on or off. A room that is off cannot be booked; classes already in it stay.');\n      const rows = d.rooms.map((room) => [\n        button(`${room.active ? '✅' : '🚫'} ${room.name}`.slice(0, 40), `rt:${room.id}`),\n        button('✏️ Rename', `rr:${room.id}`),\n      ]);\n      rows.push([button('➕ Add a room', 'rn')], MENU);\n      return { text: lines.join('\\n'), rows };\n    }\n    const lines = ['<b>Class types</b>'];\n    lines.push(d.classes.length ? 'Tap one to switch it on or off. Classes already booked stay.' : 'No class types yet.');\n    const rows = d.classes.map((c) => [button(`${c.active ? '✅' : '🚫'} ${c.name} · ${c.minutes} min`.slice(0, 60), `ct:${c.id}`)]);\n    rows.push([button('➕ Add a class type', 'cn')], MENU);\n    return { text: lines.join('\\n'), rows };\n  },\n\n  calendar(ctx, d) {\n    const lines = [\n      '<b>Calendar feed</b>',\n      'Subscribe to one of these links in Google Calendar (Other calendars, From URL), Apple Calendar or Outlook. The calendar then shows the classes and keeps itself up to date. It is read-only: changes are still made here.',\n      '',\n      'Your classes:',\n      `<code>${esc(d.mine)}</code>`,\n      '',\n      'The whole studio:',\n      `<code>${esc(d.studio)}</code>`,\n    ];\n    for (const room of d.rooms) lines.push('', `${esc(room.name)}:`, `<code>${esc(room.url)}</code>`);\n    return { text: lines.join('\\n'), rows: [MENU] };\n  },\n};\n\nfunction question(asking, current) {\n  if (asking === 'room_new') {\n    return 'Send me the name of the new room. To say how many people fit, add a number after a comma, like <code>Studio C, 20</code>.';\n  }\n  if (asking === 'room_rename') {\n    return `Send me the new name${current ? ` for <b>${esc(current)}</b>` : ''}. Add a number after a comma to change how many people fit.`;\n  }\n  return 'Send me the class type and how many minutes it lasts (15 to 480), like <code>Yoga, 60</code>.';\n}\n\nfunction refusal(d) {\n  return { text: `<b>Not possible</b>\\n${REFUSALS[d.error]}`, rows: [MENU], toast: REFUSALS[d.error] };\n}\n\n// Telegram refuses messages over 4096 characters. Lines never split a tag, so\n// cutting at a line break keeps the HTML valid.\nfunction fit(text) {\n  if (text.length <= 4000) return text;\n  const cut = text.lastIndexOf('\\n', 3900);\n  return `${text.slice(0, cut > 0 ? cut : 3900)}\\n…`;\n}\n\nfunction render(route, data, begin) {\n  const ctx = { route, begin, today: begin.today, wiz: route.wiz };\n  const d = data || {};\n  const view = d.ok === false && REFUSALS[d.error] ? refusal(d) : SCREENS[route.screen](ctx, d);\n\n  const calls = [];\n  const { reply } = route;\n  if (reply.callback_id) {\n    const body = { callback_query_id: reply.callback_id };\n    if (view.toast) body.text = view.toast.slice(0, 190);\n    calls.push({ method: 'answerCallbackQuery', body });\n  }\n  const body = {\n    chat_id: reply.chat_id,\n    text: fit(view.text),\n    parse_mode: 'HTML',\n    disable_web_page_preview: true,\n  };\n  // Without buttons the field is left out: an edit then also removes the old keyboard.\n  if (view.rows && view.rows.length) body.reply_markup = { inline_keyboard: view.rows };\n  calls.push(\n    reply.message_id\n      ? { method: 'editMessageText', body: { ...body, message_id: reply.message_id } }\n      : { method: 'sendMessage', body },\n  );\n  return calls;\n}\n\nconst routed = $('Route').first().json;\nconst begin = $('Begin').first().json.data;\n// The Menu branch arrives straight from Route and has no database answer.\nconst answer = $input.first().json.data ?? null;\nreturn render(routed, answer, begin).map((call) => ({ json: call }));"
+      },
+      "id": "c01a04f4-3078-4936-889c-3afbcc574c7f",
+      "name": "Render",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.schedule($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.req) }}"
+        }
+      },
+      "id": "0a51ad8e-de38-492e-81dd-5354c6318c08",
+      "name": "Schedule",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        -880
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.options($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.req) }}"
+        }
+      },
+      "id": "c95cae11-1e2e-4116-8201-629aad994ef8",
+      "name": "Options",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        -720
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.days($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.req) }}"
+        }
+      },
+      "id": "f4bed5fb-a8c4-4b48-89f2-47113f5c6ad9",
+      "name": "Days",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        -560
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.slots($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.req) }}"
+        }
+      },
+      "id": "6c56257b-4839-4f55-8530-b1da8ad1aa2c",
+      "name": "Free times",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        -400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.preview($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.req) }}"
+        }
+      },
+      "id": "8682143a-6f67-47af-88c8-82af45a673ae",
+      "name": "Preview",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        -240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.book($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.req) }}"
+        }
+      },
+      "id": "c99d90d2-e385-449e-8744-d775e60ca753",
+      "name": "Book",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        -80
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.bookings($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.req) }}"
+        }
+      },
+      "id": "4adf65e8-2581-453f-8bf3-ac8e12bb7226",
+      "name": "My classes",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        80
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.booking_details($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.req) }}"
+        }
+      },
+      "id": "c97e4f2f-5760-4674-8350-d5f0a13a8032",
+      "name": "Class",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.cancel($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.req) }}"
+        }
+      },
+      "id": "81bb309b-a774-4dd6-8b45-546e30196ee9",
+      "name": "Cancel",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.reschedule($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.req) }}"
+        }
+      },
+      "id": "8036f180-5f75-4001-8ab6-25c9d158206c",
+      "name": "Move",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        560
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.people($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.req) }}"
+        }
+      },
+      "id": "3e7ff6d5-dec5-46e8-8352-2dd608065222",
+      "name": "People",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        720
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.manage($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.req) }}"
+        }
+      },
+      "id": "606de014-c4f4-41f4-89c8-2a21a057261a",
+      "name": "Rooms and class types",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        880
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.calendar($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.req) }}"
+        }
+      },
+      "id": "8294736e-27ee-4bed-88df-2ce00fafffe7",
+      "name": "Calendar links",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        1040
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Begin').first().json.data.api }}/{{ $json.method }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "6b13b851-3c96-4489-8661-6ca3c08b0aa2",
+      "name": "Telegram API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1460,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Telegram answers every call with { ok }. Two refusals are normal and are\n// not errors: an edit that changes nothing, and a tap on a button so old\n// that the acknowledgement is refused. If the message to edit is gone, the\n// reply is sent as a new message instead. Anything else fails the run, so\n// it shows up in Executions and reaches the error workflow.\nconst calls = $('Render').all();\nconst resend = [];\n$input.all().forEach((item, index) => {\n  const call = calls[index].json;\n  if (item.json.ok === true) return;\n  const why = String(item.json.description ?? 'no answer from Telegram');\n  if (call.method === 'answerCallbackQuery') return;\n  if (call.method === 'editMessageText') {\n    if (/not modified/i.test(why)) return;\n    if (/message to edit not found|can't be edited|MESSAGE_ID_INVALID/i.test(why)) {\n      const { message_id, ...body } = call.body;\n      resend.push({ json: { method: 'sendMessage', body } });\n      return;\n    }\n  }\n  throw new Error(`Telegram refused ${call.method}: ${why}`);\n});\nreturn resend;"
+      },
+      "id": "7ebb9443-c408-4283-84ba-530e3e857749",
+      "name": "Check replies",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        -140
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Begin').first().json.data.api }}/{{ $json.method }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {}
+      },
+      "id": "bbba196e-89e1-4822-87bd-61f1cf8e51af",
+      "name": "Send instead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1900,
+        -140
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Tell the others\nA change can concern people who did not tap anything: the trainer whose class an admin moved, the admins when someone asks for access. Those messages were written to `studio.outbox` in the same transaction as the change; they are delivered here, straight after the reply.",
+        "width": 1080,
+        "height": 330,
+        "color": 5
+      },
+      "id": "af503402-ed5e-4e6b-8735-77e00bcccaf4",
+      "name": "After the reply",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1620,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.claim_due($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ limit: 25 }) }}"
+        }
+      },
+      "id": "dcac0849-fab9-4dbb-8d82-1eca05d20bb5",
+      "name": "Claim outbox",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1680,
+        240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Shared by every Code node. scripts/build.mjs pastes this file in front of\n// route.js, render.js and notify.js, because n8n Code nodes cannot import.\n\nconst WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];\nconst MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];\n\n// Everything that came from a person or the database goes through esc()\n// before it is put into a message, because messages are sent as HTML.\nconst esc = (value) =>\n  String(value ?? '')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;');\n\n// Days travel as \"2026-11-14\" in data and as \"20261114\" inside buttons. They\n// are plain calendar dates in the studio's time zone; Postgres owns the clock.\nconst asDate = (iso) => new Date(`${iso}T00:00:00Z`);\nconst addDays = (iso, count) => {\n  const date = asDate(iso);\n  date.setUTCDate(date.getUTCDate() + count);\n  return date.toISOString().slice(0, 10);\n};\nconst dayName = (iso) => {\n  const date = asDate(iso);\n  return `${WEEKDAYS[date.getUTCDay()]} ${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]}`;\n};\nconst dayLabel = (iso, today) => {\n  if (iso === today) return `${dayName(iso)} (today)`;\n  if (iso === addDays(today, 1)) return `${dayName(iso)} (tomorrow)`;\n  return dayName(iso);\n};\nconst packDay = (iso) => iso.replace(/-/g, '');\nconst unpackDay = (packed) => {\n  if (!/^\\d{8}$/.test(packed ?? '')) return null;\n  const iso = `${packed.slice(0, 4)}-${packed.slice(4, 6)}-${packed.slice(6, 8)}`;\n  const date = asDate(iso);\n  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === iso ? iso : null;\n};\nconst packTime = (hhmm) => hhmm.replace(':', '');\nconst unpackTime = (packed) => {\n  if (!/^\\d{4}$/.test(packed ?? '')) return null;\n  const hours = Number(packed.slice(0, 2));\n  const minutes = Number(packed.slice(2, 4));\n  return hours < 24 && minutes < 60 ? `${packed.slice(0, 2)}:${packed.slice(2, 4)}` : null;\n};\n\nconst button = (text, data) => ({ text, callback_data: data });\nconst rowsOf = (items, perRow) => {\n  const rows = [];\n  for (let i = 0; i < items.length; i += perRow) rows.push(items.slice(i, i + perRow));\n  return rows;\n};\n\n// A booking or a move in progress is not stored anywhere. Each button carries\n// every choice made so far, for example \"b:c2:r1:d20261114:t0900\":\n//   c class type   r room (0 = ask)   d day   t start time\n//   p trainer (0 = ask)   n weeks to repeat   w week shown in the day picker\n// So there is no session to expire or to get out of step with the screen, and\n// \"Back\" is simply the same data with the last choice left out. Telegram\n// allows 64 bytes per button; the longest of these is under 50.\nconst STEP_KEYS = ['c', 'r', 'd', 't', 'p', 'n', 'w'];\nconst wizard = (base, steps) =>\n  [base]\n    .concat(\n      STEP_KEYS.filter((key) => steps[key] !== undefined && steps[key] !== null).map(\n        (key) => `${key}${steps[key]}`,\n      ),\n    )\n    .join(':');\nconst without = (steps, ...keys) =>\n  Object.fromEntries(Object.entries(steps).filter(([key]) => !keys.includes(key)));\nconst readSteps = (parts) => {\n  const steps = {};\n  for (const part of parts) {\n    const key = part[0];\n    const value = part.slice(1);\n    if (!STEP_KEYS.includes(key)) continue;\n    if (key === 'd' && unpackDay(value)) steps.d = value;\n    else if (key === 't' && unpackTime(value)) steps.t = value;\n    else if ('crpnw'.includes(key) && /^\\d{1,9}$/.test(value)) steps[key] = String(Number(value));\n  }\n  return steps;\n};\n// The \"Write notifications\" Code node: turn rows of studio.outbox into\n// messages. These go to people who did not tap anything: a trainer whose class\n// an admin moved, the admins when someone asks for access, reminders.\n\nfunction classLines(b, today) {\n  return [\n    `<b>${esc(b.class)}</b> · ${b.minutes} min`,\n    `Room: ${esc(b.room)}`,\n    `When: ${dayLabel(b.day, today)}, ${b.from}–${b.to}`,\n    `Trainer: ${esc(b.trainer)}`,\n  ].join('\\n');\n}\n\nfunction leadTime(minutes) {\n  if (minutes === 1440) return 'Tomorrow at this time';\n  if (minutes > 1440 && minutes % 1440 === 0) return `In ${minutes / 1440} days`;\n  if (minutes >= 60 && minutes % 60 === 0) return minutes === 60 ? 'In 1 hour' : `In ${minutes / 60} hours`;\n  return `In ${minutes} minutes`;\n}\n\nconst NOTIFICATIONS = {\n  access_request(p) {\n    return {\n      text: `<b>${esc(p.name)}</b>${p.username ? ` (@${esc(p.username)})` : ''} wants to use the studio bot.`,\n      rows: [[button('Review', `pv:${p.person_id}`)]],\n    };\n  },\n\n  access_granted(p, ctx) {\n    const role = p.role === 'admin' ? 'an admin' : 'a trainer';\n    return {\n      text: p.first_time\n        ? `You are in. You can now use the <b>${esc(ctx.studio.name)}</b> bot as ${role}.`\n        : `Your role at <b>${esc(ctx.studio.name)}</b> changed: you are now ${role}.`,\n      rows: [[button('Open the menu', 'h')]],\n    };\n  },\n\n  booked(p, ctx) {\n    const who = p.yours ? `${esc(p.actor)} booked you for` : `${esc(p.actor)} booked`;\n    const what = p.count > 1 ? `${p.count} weekly classes, starting with:` : 'a class:';\n    return {\n      text: `${who} ${what}\\n\\n${classLines(p.booking, ctx.today)}`,\n      rows: [[button('Open class', `v:${p.booking.id}`)]],\n    };\n  },\n\n  moved(p, ctx) {\n    return {\n      text: [\n        `${esc(p.actor)} moved ${p.yours ? 'your class' : 'a class'}.`,\n        '',\n        classLines(p.booking, ctx.today),\n        '',\n        `Was: ${dayLabel(p.was.day, ctx.today)}, ${p.was.from}–${p.was.to} · ${esc(p.was.room)}`,\n      ].join('\\n'),\n      rows: [[button('Open class', `v:${p.booking.id}`)]],\n    };\n  },\n\n  cancelled(p, ctx) {\n    const what = p.count > 1 ? `${p.count} classes, starting with:` : p.yours ? 'your class:' : 'a class:';\n    return {\n      text: `${esc(p.actor)} cancelled ${what}\\n\\n${classLines(p.booking, ctx.today)}`,\n      rows: [[button('📅 That day', `s:${packDay(p.booking.day)}`)]],\n    };\n  },\n\n  reminder(p, ctx) {\n    return {\n      text: `<b>Reminder</b> · ${leadTime(p.minutes)}\\n\\n${classLines(p.booking, ctx.today)}`,\n      rows: [[button('Open class', `v:${p.booking.id}`)]],\n    };\n  },\n\n  digest(p) {\n    const lines = [`<b>Your classes today</b>, ${dayName(p.day)}`, ''];\n    for (const b of p.classes) lines.push(`${b.from}–${b.to}  ${esc(b.class)} · ${esc(b.room)}`);\n    return { text: lines.join('\\n'), rows: [[button(\"📅 Today's schedule\", 's')]] };\n  },\n\n  alert(p) {\n    const lines = ['<b>The studio bot hit an error</b>', `Workflow: ${esc(p.workflow)}`];\n    if (p.node) lines.push(`Step: ${esc(p.node)}`);\n    lines.push('', esc(p.message));\n    if (p.url) lines.push('', esc(p.url));\n    return { text: lines.join('\\n'), rows: [] };\n  },\n};\n\n// ctx = the answer of studio.claim_due: { studio, today, messages }\nfunction notifications(ctx) {\n  return ctx.messages.map((message) => {\n    const write = NOTIFICATIONS[message.kind];\n    const view = write\n      ? write(message.payload, ctx)\n      : { text: `Studio bot: ${esc(message.kind)}`, rows: [] };\n    const body = { chat_id: message.chat_id, text: view.text, parse_mode: 'HTML', disable_web_page_preview: true };\n    if (view.rows.length) body.reply_markup = { inline_keyboard: view.rows };\n    return { id: message.id, method: 'sendMessage', body };\n  });\n}\n\nconst due = $input.first().json.data;\nreturn notifications(due).map((message) => ({ json: message }));"
+      },
+      "id": "2cce17b5-6e19-4cd2-81bd-497f17fc7f89",
+      "name": "Write notifications",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1900,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Claim outbox').first().json.data.api }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "60c232ec-6a1d-49ee-8bd2-90ed924d2247",
+      "name": "Send notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2120,
+        240
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// One row per message: did Telegram take it? A message that failed stays in\n// the outbox and is tried again by a later run.\nconst queued = $('Write notifications').all();\nconst results = $input.all().map((item, index) => ({\n  id: queued[index].json.id,\n  ok: item.json.ok === true,\n  error: item.json.ok === true ? null : String(item.json.description ?? item.json.error?.message ?? item.json.error ?? 'send failed'),\n}));\nreturn [{ json: { results } }];"
+      },
+      "id": "4670580f-25de-46d0-8e8a-528e8bcc56ec",
+      "name": "Collect results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2340,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT studio.record_deliveries($1::jsonb) AS data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json) }}"
+        }
+      },
+      "id": "aca52708-2868-4d90-827e-3a07dd2f3122",
+      "name": "Record deliveries",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2560,
+        240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "studioBotPostgres",
+          "name": "Studio Bot Postgres"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Begin",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Begin": {
+      "main": [
+        [
+          {
+            "node": "Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route": {
+      "main": [
+        [
+          {
+            "node": "Branch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Branch": {
+      "main": [
+        [
+          {
+            "node": "Render",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Schedule",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Options",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Days",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Free times",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Preview",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Book",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "My classes",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Class",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Cancel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Move",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "People",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Rooms and class types",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Calendar links",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule": {
+      "main": [
+        [
+          {
+            "node": "Render",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Options": {
+      "main": [
+        [
+          {
+            "node": "Render",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Days": {
+      "main": [
+        [
+          {
+            "node": "Render",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Free times": {
+      "main": [
+        [
+          {
+            "node": "Render",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preview": {
+      "main": [
+        [
+          {
+            "node": "Render",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Book": {
+      "main": [
+        [
+          {
+            "node": "Render",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "My classes": {
+      "main": [
+        [
+          {
+            "node": "Render",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Class": {
+      "main": [
+        [
+          {
+            "node": "Render",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cancel": {
+      "main": [
+        [
+          {
+            "node": "Render",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Move": {
+      "main": [
+        [
+          {
+            "node": "Render",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "People": {
+      "main": [
+        [
+          {
+            "node": "Render",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rooms and class types": {
+      "main": [
+        [
+          {
+            "node": "Render",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calendar links": {
+      "main": [
+        [
+          {
+            "node": "Render",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render": {
+      "main": [
+        [
+          {
+            "node": "Telegram API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram API": {
+      "main": [
+        [
+          {
+            "node": "Check replies",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Claim outbox",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check replies": {
+      "main": [
+        [
+          {
+            "node": "Send instead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim outbox": {
+      "main": [
+        [
+          {
+            "node": "Write notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write notifications": {
+      "main": [
+        [
+          {
+            "node": "Send notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send notification": {
+      "main": [
+        [
+          {
+            "node": "Collect results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect results": {
+      "main": [
+        [
+          {
+            "node": "Record deliveries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "id": "studioBotChat0001"
+}
