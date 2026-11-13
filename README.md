@@ -1,5 +1,7 @@
 # n8n Telegram class booking
 
+[![test](https://github.com/lunox-work/n8n-telegram-class-booking/actions/workflows/test.yml/badge.svg)](https://github.com/lunox-work/n8n-telegram-class-booking/actions/workflows/test.yml)
+
 A Telegram bot for a fitness studio, built with n8n and PostgreSQL. Trainers and admins see the schedule and the free times, book rooms for classes, move and cancel them, and get reminders. A room is never booked twice, and a trainer is never booked into two rooms at once.
 
 Import four workflows and run one SQL file. No community nodes, no paid n8n features.
@@ -158,7 +160,7 @@ npm run test:e2e    # starts n8n, Postgres and a Telegram stand-in, plays 22 sce
 
 The end-to-end suite imports the workflows into a real n8n, points the Telegram credential at [`test/mock-telegram.mjs`](test/mock-telegram.mjs) and behaves like people using the bot: it posts updates to n8n's webhook and reads the replies. The stand-in rejects what the real Bot API rejects (bad HTML, button data over 64 bytes, edits that change nothing). The scenarios include two people confirming the same slot at the same moment, a double tap, forged buttons from a trainer, a reminder arriving once, and a failing run reaching the admins.
 
-Last run: n8n 2.47.5, PostgreSQL 17, all 22 scenarios and 8 unit tests passing.
+Both suites run on every push in GitHub Actions. Last run: n8n 2.47.5, PostgreSQL 17, all 22 scenarios and 8 unit tests passing.
 
 ## Good to know
 
